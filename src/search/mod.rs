@@ -1,12 +1,6 @@
-extern crate crossbeam;
-extern crate itertools;
-
 use std::cmp::Ordering;
+use std::iter::ExactSizeIterator;
 use std::usize;
-
-use self::crossbeam::channel;
-use self::crossbeam::scope as thread_scope;
-use self::itertools::kmerge;
 
 use score::{has_match, locate_inner, score_inner, LocateResult, ScoreResult};
 
@@ -15,6 +9,7 @@ pub type ScoreResults = Vec<ScoreResult>;
 /// Collection of scores, locations, and the candidates they apply to
 pub type LocateResults = Vec<LocateResult>;
 
+#[cfg(feature = "parallel")]
 /// Search among a collection of candidates using the given query, returning
 /// an ordered collection of results (highest score first)
 pub fn search_score(
@@ -25,6 +20,7 @@ pub fn search_score(
   search_internal(query, candidates, parallelism, score_inner).collect()
 }
 
+#[cfg(feature = "parallel")]
 /// Search among a collection of candidates using the given query, returning
 /// an ordered collection of results (highest score first) with the locations
 /// of the query in each candidate
@@ -36,6 +32,21 @@ pub fn search_locate(
   search_internal(query, candidates, parallelism, locate_inner).collect()
 }
 
+pub fn search_serial(
+  query: &str,
+  candidates: impl Iterator<Item = impl AsRef<str>> + ExactSizeIterator,
+) -> ScoreResults {
+  search_worker(candidates, query, 0, score_inner)
+}
+
+pub fn locate_serial(
+  query: &str,
+  candidates: impl Iterator<Item = impl AsRef<str>> + ExactSizeIterator,
+) -> LocateResults {
+  search_worker(candidates, query, 0, locate_inner)
+}
+
+#[cfg(feature = "parallel")]
 fn search_internal<T>(
   query: &str,
   candidates: &[&str],
@@ -47,12 +58,12 @@ where
 {
   let parallelism = calculate_parallelism(candidates.len(), parallelism, query.is_empty());
   let mut candidates = candidates;
-  let (sender, receiver) = channel::bounded::<Vec<T>>(parallelism);
+  let (sender, receiver) = crossbeam::channel::bounded::<Vec<T>>(parallelism);
 
   if parallelism < 2 {
-    Box::new(search_worker(candidates, query, 0, search_fn).into_iter())
+    Box::new(search_worker(candidates.iter(), query, 0, search_fn).into_iter())
   } else {
-    thread_scope(|scope| {
+    crossbeam::scope(|scope| {
       let mut remaining_candidates = candidates.len();
       let per_thread_count = ceil_div(remaining_candidates, parallelism);
       let mut thread_offset = 0;
@@ -71,7 +82,7 @@ where
         let splitted_len = split.0.len();
         let sender = sender.clone();
         scope.spawn(move || {
-          sender.send(search_worker(split.0, query, thread_offset, search_fn));
+          sender.send(search_worker(split.0.iter(), query, thread_offset, search_fn));
         });
         thread_offset += splitted_len;
 
@@ -82,13 +93,13 @@ where
       drop(sender);
     });
 
-    Box::new(kmerge(receiver))
+    Box::new(itertools::kmerge(receiver))
   }
 }
 
 // Search among candidates against a query in a single thread
 fn search_worker<T>(
-  candidates: &[&str],
+  candidates: impl IntoIterator<Item = impl AsRef<str>> + ExactSizeIterator,
   query: &str,
   offset_index: usize,
   search_fn: fn(&str, &str, usize) -> T
@@ -98,6 +109,7 @@ where
 {
   let mut out = Vec::with_capacity(candidates.len());
   for (index, candidate) in candidates.into_iter().enumerate() {
+    let candidate = candidate.as_ref();
     if has_match(&query, candidate) {
       out.push(search_fn(&query, candidate, offset_index + index));
     }
@@ -107,6 +119,7 @@ where
   out
 }
 
+#[cfg(feature = "parallel")]
 fn calculate_parallelism(
   candidate_count: usize,
   configured_parallelism: usize,
@@ -130,12 +143,14 @@ fn calculate_parallelism(
     .max(1)
 }
 
+#[cfg(feature = "parallel")]
 /// Integer ceiling division
 fn ceil_div(a: usize, b: usize) -> usize {
   (a + b - 1) / b
 }
 
 #[cfg(test)]
+#[cfg(feature = "parallel")]
 mod tests {
   use super::*;
 
